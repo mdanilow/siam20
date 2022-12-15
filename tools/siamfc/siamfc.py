@@ -79,6 +79,7 @@ def to_binarray(x, bitwidth, folding=8, reverse_endian=True, reverse_inner=True,
     # result_bytes = bytearray(result_bytes)
     with open(outpath, "wb") as outfile:
         outfile.write(result_bytes)
+    print(outpath, "saved")
     #     for n in range(N):
     #         for h in range(H):
     #             for w in range(W):
@@ -109,6 +110,7 @@ class TrackerSiamFC(Tracker):
     def __init__(self, net_path=None, **kwargs):
         super(TrackerSiamFC, self).__init__('SiamFC', True)
         self.cfg = self.parse_args(**kwargs)
+        self.frame = 0
 
         # setup GPU device if available
         self.cuda = torch.cuda.is_available()
@@ -144,11 +146,36 @@ class TrackerSiamFC(Tracker):
 
     def parse_args(self, **kwargs):
         # default parameters
+        # cfg = {
+        #     # basic parameters
+        #     'out_scale': 0.001,
+        #     'exemplar_sz': 127,
+        #     'instance_sz': 255,
+        #     'context': 0.5,
+        #     # inference parameters
+        #     'scale_num': 1,
+        #     'scale_step': 1.0375,
+        #     'scale_lr': 0.59,
+        #     'scale_penalty': 0.9745,
+        #     'window_influence': 0.176,
+        #     'response_sz': 17,
+        #     'response_up': 16,
+        #     'total_stride': 8,
+        #     # train parameters
+        #     'epoch_num': 50,
+        #     'batch_size': 8,
+        #     'num_workers': 32,
+        #     'initial_lr': 1e-2,
+        #     'ultimate_lr': 1e-5,
+        #     'weight_decay': 5e-4,
+        #     'momentum': 0.9,
+        #     'r_pos': 16,
+        #     'r_neg': 0}
         cfg = {
             # basic parameters
             'out_scale': 0.001,
-            'exemplar_sz': 127,
-            'instance_sz': 255,
+            'exemplar_sz': 110,
+            'instance_sz': 238,
             'context': 0.5,
             # inference parameters
             'scale_num': 1,
@@ -211,11 +238,22 @@ class TrackerSiamFC(Tracker):
             img, self.center, self.z_sz,
             out_size=self.cfg.exemplar_sz,
             border_value=self.avg_color)
-        
+        template_pad = self.cfg.instance_sz - self.cfg.exemplar_sz
+        padded_z_np = np.pad(z, ((0, template_pad), (0, template_pad), (0, 0)))
+        # cv2.imwrite('test_inputs/test_input_238x238_{}.ppm'.format(self.frame), cv2.cvtColor(padded_z_np, cv2.COLOR_BGR2RGB))
         # exemplar features
         z = torch.from_numpy(z).to(
             self.device).permute(2, 0, 1).unsqueeze(0).float()
+        padded_z = F.pad(z, [0, template_pad, 0, template_pad])
         self.kernel = self.net.backbone(z)
+        padded_kernel_quant = simulate_quant(self.net.backbone(padded_z),
+                                            mul_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Mul_0_param0.npy',
+                                            add_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Add_0_param0.npy')
+        # to_binarray(padded_kernel_quant, bitwidth=24, outpath='test_inputs/crossing_0.bin')
+        self.kernel_quant = simulate_quant(self.kernel,
+                                            mul_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Mul_0_param0.npy',
+                                            add_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Add_0_param0.npy')
+        
 
         # FOR FINN PURPOSES (collect data to run tracker in FPGA)
         save_path = "../XOH/data/Crossing/parameters/"
@@ -250,7 +288,9 @@ class TrackerSiamFC(Tracker):
 
         # print('tha eshape', x.shape, type(x))
         # np.save('test_input.npy', x)
-        # cv2.imwrite('test_input_238x238.ppm', cv2.cvtColor(x[0], cv2.COLOR_BGR2RGB))
+        self.frame += 1
+        cv2.imwrite('test_input_238x238_{}.ppm'.format(self.frame), cv2.cvtColor(x[0], cv2.COLOR_BGR2RGB))
+        # x[0] = cv2.cvtColor(x[0], cv2.COLOR_BGR2RGB)
         in_img = x[0]
         
         x = torch.from_numpy(x).to(
@@ -262,10 +302,16 @@ class TrackerSiamFC(Tracker):
         out = simulate_quant(x,
                             mul_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Mul_0_param0.npy',
                             add_path='/home/vision/danilowi/siam_tracking/SIAM_2/iprepo/finn_dev_vision_nopreproc/Add_0_param0.npy')
-        # print('out:', out[0, 0])
-        to_binarray(out, bitwidth=24, outpath='test_inputs/siamlayer_out.bin')
-        responses = self.net.head(self.kernel, x)
+        # print('out:', np.min(out), np.max(out), np.unique(out).shape)
+        # to_binarray(out, bitwidth=24, outpath='test_inputs/crossing_{}.bin'.format(self.frame))
+        # print('kernel:', self.kernel.shape)
+        # responses = self.net.head(self.kernel, x)
+        # print('exemplar:', self.kernel_quant.shape, 'search region:', out.shape)
+        responses = self.net.head(torch.tensor(self.kernel_quant), torch.tensor(out))
         responses = responses.squeeze(1).cpu().numpy()
+        responses_sc = responses / (256*256)
+        maxpos = np.unravel_index(responses[0].argmax(), responses[0].shape)
+        # print('maxpos:', maxpos)
 
         # upsample responses and penalize scale changes
         responses = np.stack([cv2.resize(

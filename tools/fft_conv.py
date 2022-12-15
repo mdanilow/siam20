@@ -1,10 +1,91 @@
 from functools import partial
 from typing import Iterable, Tuple, Union
 
+import sys
+from fxpmath import Fxp
+import numpy as np
 import torch
 import torch.nn.functional as f
 from torch import Tensor, nn
 from torch.fft import irfftn, rfftn
+
+
+def quantize_fi(x, signed, int_bits, frac_bits, outfile=None, folding=1):
+
+    # print(str(x.dtype), x[-1, 0, 0], 'complex' in str(x.dtype))
+    width = int_bits + frac_bits
+    print('quantize fi shape:', len(x.shape), x.shape)
+    batches, channels, h, w = x.shape
+    in_x_r = np.real(x)
+    channels_per_fold = channels // folding
+    x = x.reshape((batches, folding, channels_per_fold, h, w))
+    x_r = np.real(x)
+    x = Fxp(x, signed, width, frac_bits)
+    
+    if outfile:
+        content = 'memory_initialization_radix=2;\n'
+        content += 'memory_initialization_vector=\n'
+        for batch in range(batches):
+            for fold in range(folding):  
+                for row in range(h):
+                    for col in range(w):
+                        for channel in range(channels_per_fold):
+                            el = x[batch, fold, channel, row, col]
+                            if 'complex' in str(x.dtype):
+                                # print(type(el.bin()), el.bin(), el.shape)
+                                # print(str(el.bin()))
+                                bin_repr = str(el.bin())[:-1]
+                                bin_repr = bin_repr.replace('+', '')
+                                bin_repr = bin_repr.replace('-', '')
+                                bin_real = bin_repr[0:width]
+                                bin_imag = bin_repr[width:]
+                                content += bin_imag + bin_real
+                            else:
+                                content += el.bin()
+                        content += '\n'
+        content += ';'
+
+        with open(outfile, 'w') as result_file:
+            result_file.write(content)
+        sys.exit()
+
+
+# x in NCHW shape
+def to_binarray(x, bitwidth, folding=8, reverse_endian=True, reverse_inner=True, outpath='bytearray.bin'):
+
+    # fold channels
+    x = x.astype('int32')
+    N, C, H, W = x.shape
+    channels_per_fold = C // folding
+    x = x.reshape((N, folding, channels_per_fold, H, W))
+
+    # change each number to u2 integer
+    result = np.zeros(x.shape, dtype=int)
+    mask = x < 0
+    result[mask] = x[mask] + (1 << bitwidth)
+    result[~mask] = x[~mask]
+
+    # divide each number to bytes
+    bytes_per_num = bitwidth // 8
+    result_bytes = np.zeros(result.shape + (bytes_per_num,), dtype=int)
+    print('result_bytes:', result_bytes.shape)
+    for byte in range(bytes_per_num):
+        result_bytes[..., byte] = (result >> byte*8) & 255
+
+    # reverse bytes
+    if reverse_endian:
+        result_bytes = np.flip(result_bytes, axis=-1)
+    # reverse channels in each fold
+    if reverse_inner:
+        result_bytes = np.flip(result_bytes, axis=2)
+
+    # result_bytes in [batch, fold, channels_per_fold, h, w, bytes_per_num] shape
+    # transpose to [batch, h, w, fold, channel_per_fold, bytes_per_num]
+    result_bytes = result_bytes.transpose((0, 3, 4, 1, 2, 5))
+    result_bytes = result_bytes.astype(np.uint8).tobytes()
+    # result_bytes = bytearray(result_bytes)
+    with open(outpath, "wb") as outfile:
+        outfile.write(result_bytes)
 
 
 def complex_matmul(a: Tensor, b: Tensor, groups: int = 1) -> Tensor:
@@ -113,20 +194,63 @@ def fft_conv(
 
     # Perform fourier convolution -- FFT, matrix multiply, then IFFT
     # signal_ = signal_.reshape(signal_.size(0), groups, -1, *signal_.shape[2:])
+    # print("tofft signal, kernel", signal_.shape, padded_kernel.shape)
+    # print(padded_kernel[0, 0])
+    MYPAD_signal_ = f.pad(signal_, [0, 10, 0, 10])
+    # print('signal range:', torch.min(signal_), torch.max(signal_), np.unique(signal_.cpu().numpy()).shape)
+    # to_binarray(MYPAD_signal_.cpu().numpy(), bitwidth=16, folding=1, outpath="test_inputs/signal32x32_w16.bin")
+    MYPAD_padded_kernel = f.pad(padded_kernel, [0, 10, 0, 10])
     signal_fr = rfftn(signal_, dim=tuple(range(2, signal.ndim)))
     kernel_fr = rfftn(padded_kernel, dim=tuple(range(2, signal.ndim)))
+    kernel_fr_torch_r = np.real(rfftn(MYPAD_padded_kernel, dim=tuple(range(2, signal.ndim)))/256)
+    kernel_fr_torch_i = np.imag(rfftn(MYPAD_padded_kernel, dim=tuple(range(2, signal.ndim)))/256)
+
+
+    signal_fr_np = np.fft.fft2(MYPAD_signal_)
+    kernel_fr_np = np.fft.fft2(MYPAD_padded_kernel)
+    # NOPAD_kernel_fr = rfftn(kernel, dim=tuple(range(2, signal.ndim)))
+
+    # NOPAD_kernel_fr_r = np.real(NOPAD_kernel_fr)
+    # NOPAD_kernel_fr_i = np.imag(NOPAD_kernel_fr)
+    # signal_fr_r_np = np.real(np.fft.fft2(signal_.cpu().numpy()))
 
     kernel_fr.imag *= -1
+    kernel_fr_np.imag *= -1
+
+    kernel_fr_np /= 256
+    # quantize_fi(kernel_fr_np[:, :, :, :17], True, 16, 0, folding=8, outfile='memory_inits/crossing_template_32x17_s16_0.coe')
+    signal_fr_np /= 256
+    output_fr_np = signal_fr_np * kernel_fr_np
+    signal_fr_r = np.real(signal_fr_np)
+    signal_fr_i = np.imag(signal_fr_np)
+    kernel_fr_r = np.real(kernel_fr_np)
+    kernel_fr_i = np.imag(kernel_fr_np)
+    # print('template range r', np.min(kernel_fr_r), np.max(kernel_fr_r), 'imag:', np.min(kernel_fr_i), np.max(kernel_fr_i))
+    output_fr_np_r = np.real(output_fr_np)
+    output_fr_np_i = np.imag(output_fr_np)
+    # print('product range range r', np.min(output_fr_np_r), np.max(output_fr_np_r), 'imag:', np.min(output_fr_np_i), np.max(output_fr_np_i))
+
+    output_fr_np_16_REAL = np.real(output_fr_np[:, :16, :, :])
+    output_fr_np_16sum = np.sum(output_fr_np[:, :16, :, :], axis=1)
+    output_fr_np_16sum_r = np.real(output_fr_np_16sum)
+    output_fr_np_32sum_r = np.real(np.sum(output_fr_np[:, :32, :, :], axis=1))
+    output_fr_np_sum = np.sum(output_fr_np, axis=1)
+    output_fr_np_sum_r = np.real(output_fr_np_sum)
+    # print('max output_fr_np_sum_r:', np.min(np.real(output_fr_np_sum)), np.max(np.real(output_fr_np_sum)))
+
     output_fr = complex_matmul(signal_fr, kernel_fr, groups=groups)
     output = irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
-
+    output_np = np.real(np.fft.ifft2(output_fr_np_sum))
+    output_np_r = output_np/256
+    # print('output:', output.shape)
     # Remove extra padded values
     crop_slices = [slice(0, output.size(0)), slice(0, output.size(1))] + [
         slice(0, (signal.size(i) - kernel.size(i) + 1), stride_[i - 2])
         for i in range(2, signal.ndim)
     ]
+    # print('crop slices', crop_slices)
     output = output[crop_slices].contiguous()
-
+    # print('output cropped', output.shape)
     # Optionally, add a bias term before returning.
     if bias is not None:
         bias_shape = tuple([1, -1] + (signal.ndim - 2) * [1])
